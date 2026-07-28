@@ -82,12 +82,7 @@ CampusPulse is a Digital Marketing & Social Media Management Dashboard designed 
 ### 1. Credentials
 You can log in to the dashboard using these seeded credentials:
 - **Faculty / Admin Profile**:
-  - **Email**: `admin@campus.edu`
-  - **Password**: `admin123`
 - **Student Coordinator Profile**:
-  - **Email**: `student@campus.edu`
-  - **Password**: `student123`
-
 ### 2. Testing the End-to-End Workflow Flow
 1. **Login as Student Coordinator**:
    - Access `http://localhost:5173` and log in as `student@campus.edu` / `student123`.
