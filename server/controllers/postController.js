@@ -1,5 +1,53 @@
 const Post = require('../models/Post');
+const User = require('../models/User');
 const EngagementStat = require('../models/EngagementStat');
+const ACTIVE_CONFLICT_STATUSES = ['Draft', 'Pending Approval', 'Approved', 'Scheduled'];
+
+const getScheduleSlot = (scheduledFor) => {
+  const scheduleTime = new Date(scheduledFor);
+  scheduleTime.setSeconds(0, 0);
+  return scheduleTime;
+};
+
+const findScheduleConflicts = async (scheduledFor, excludePostId, department) => {
+  const scheduleTime = new Date(scheduledFor);
+  if (Number.isNaN(scheduleTime.getTime())) {
+    return [];
+  }
+
+  const scheduleSlot = getScheduleSlot(scheduleTime);
+  const nextScheduleSlot = new Date(scheduleSlot.getTime() + 60 * 1000);
+  const query = {
+    status: { $in: ACTIVE_CONFLICT_STATUSES },
+    scheduledFor: {
+      $gte: scheduleSlot,
+      $lt: nextScheduleSlot
+    }
+  };
+
+  if (department) {
+    const departmentUsers = await User.find({ department }).select('_id');
+    query.authorRef = { $in: departmentUsers.map(user => user._id) };
+  }
+
+  if (excludePostId) {
+    query._id = { $ne: excludePostId };
+  }
+
+  return Post.find(query)
+    .select('_id title scheduledFor status platforms')
+    .sort({ scheduledFor: 1 });
+};
+
+const sendScheduleConflict = (res, conflicts) => {
+  const conflict = conflicts[0];
+  const exactTime = new Date(conflict.scheduledFor).toLocaleString();
+  return res.status(409).json({
+    message: `Schedule conflict detected: Another event ('${conflict.title}') is already scheduled for this exact same time slot (${exactTime}). Choose a different publication time.`,
+    conflicts,
+    conflictRule: 'exact-hour-and-minute'
+  });
+};
 
 // Helper to check valid transitions
 const isValidTransition = (currentStatus, newStatus) => {
@@ -42,6 +90,77 @@ const createPost = async (req, res) => {
   } catch (error) {
     console.error('Create post error:', error);
     res.status(500).json({ message: 'Server error creating post.' });
+  }
+};
+
+const registerConflictPost = async (req, res) => {
+  try {
+    const {
+      conflictPostId,
+      title,
+      content,
+      platforms,
+      mediaUrl,
+      templateRef,
+      scheduledFor,
+      status
+    } = req.body;
+
+    if (!title?.trim() || !content?.trim() || !platforms?.length) {
+      return res.status(400).json({ message: 'Title, content, and at least one platform are required.' });
+    }
+
+    const postStatus = status === 'Pending Approval' ? 'Pending Approval' : 'Draft';
+    if (postStatus === 'Pending Approval' && !scheduledFor) {
+      return res.status(400).json({ message: 'A scheduled date and time is required to submit a post for approval.' });
+    }
+
+    let post = conflictPostId ? await Post.findById(conflictPostId) : null;
+    if (post && post.authorRef.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Unauthorized to update this conflict draft.' });
+    }
+
+    if (!post) {
+      post = new Post({ authorRef: req.user._id });
+    }
+
+    post.title = title;
+    post.content = content;
+    post.platforms = platforms;
+    post.mediaUrl = mediaUrl;
+    post.templateRef = templateRef || null;
+    post.scheduledFor = scheduledFor ? new Date(scheduledFor) : null;
+    post.status = postStatus;
+
+    await post.save();
+    res.status(conflictPostId ? 200 : 201).json(post);
+  } catch (error) {
+    console.error('Register conflict post error:', error);
+    res.status(500).json({ message: 'Server error registering the conflict post.' });
+  }
+};
+
+const checkScheduleConflict = async (req, res) => {
+  try {
+    const { scheduledFor, excludePostId } = req.query;
+
+    if (!scheduledFor) {
+      return res.json({ conflicts: [], conflictRule: 'exact-hour-and-minute' });
+    }
+
+    const scheduleTime = new Date(scheduledFor);
+    if (Number.isNaN(scheduleTime.getTime())) {
+      return res.status(400).json({ message: 'Please provide a valid scheduled date and time.' });
+    }
+
+    const conflicts = await findScheduleConflicts(scheduleTime, excludePostId, req.user.department);
+    res.json({
+      conflicts,
+      conflictRule: 'exact-hour-and-minute'
+    });
+  } catch (error) {
+    console.error('Check schedule conflict error:', error);
+    res.status(500).json({ message: 'Server error checking schedule conflicts.' });
   }
 };
 
@@ -153,6 +272,12 @@ const updatePostStatus = async (req, res) => {
       if (targetStatus === 'Scheduled' && !post.scheduledFor) {
         return res.status(400).json({ message: 'Post must have a scheduled date to be scheduled.' });
       }
+
+      const author = await User.findById(post.authorRef).select('department');
+      const conflicts = await findScheduleConflicts(post.scheduledFor, post._id, author?.department);
+      if (conflicts.length > 0) {
+        return sendScheduleConflict(res, conflicts);
+      }
     }
 
     // If student updates draft to Pending Approval
@@ -178,6 +303,68 @@ const updatePostStatus = async (req, res) => {
   } catch (error) {
     console.error('Update post status error:', error);
     res.status(500).json({ message: 'Server error updating post status.' });
+  }
+};
+
+const getScheduleConflicts = async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const departmentUsers = await User.find({ department: req.user.department }).select('_id');
+    const posts = await Post.find({
+      authorRef: { $in: departmentUsers.map(user => user._id) },
+      status: { $in: ACTIVE_CONFLICT_STATUSES },
+      scheduledFor: { $ne: null }
+    })
+      .select('_id title scheduledFor status platforms authorRef')
+      .populate('authorRef', 'name department')
+      .sort({ scheduledFor: 1 });
+
+    const conflictGroups = new Map();
+    posts.forEach(post => {
+      const scheduleSlot = getScheduleSlot(post.scheduledFor).getTime();
+      const group = conflictGroups.get(scheduleSlot) || [];
+      group.push(post);
+      conflictGroups.set(scheduleSlot, group);
+    });
+
+    res.json({
+      conflicts: Array.from(conflictGroups.values())
+        .filter(postsAtSameTime => postsAtSameTime.length > 1)
+        .map(postsAtSameTime => ({
+          scheduledFor: postsAtSameTime[0].scheduledFor,
+          posts: postsAtSameTime
+        })),
+      conflictRule: 'exact-hour-and-minute'
+    });
+  } catch (error) {
+    console.error('Get schedule conflicts error:', error);
+    res.status(500).json({ message: 'Server error fetching schedule conflicts.' });
+  }
+};
+
+const deleteScheduleConflictPost = async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.id).populate('authorRef', 'department');
+    if (!post) {
+      return res.status(404).json({ message: 'Post not found.' });
+    }
+
+    if (post.authorRef?.department !== req.user.department) {
+      return res.status(403).json({ message: 'You can only remove conflicts from your department.' });
+    }
+
+    const isOwner = post.authorRef._id.toString() === req.user._id.toString();
+    if (req.user.role !== 'Admin' && !isOwner) {
+      return res.status(403).json({ message: 'You can only delete your own conflicting posts.' });
+    }
+
+    await Post.findByIdAndDelete(post._id);
+    await EngagementStat.deleteMany({ postRef: post._id });
+
+    res.json({ message: 'Conflicting post deleted successfully.', postId: post._id });
+  } catch (error) {
+    console.error('Delete schedule conflict post error:', error);
+    res.status(500).json({ message: 'Server error deleting the conflicting post.' });
   }
 };
 
@@ -217,6 +404,10 @@ const getAnalytics = async (req, res) => {
 
 module.exports = {
   createPost,
+  registerConflictPost,
+  checkScheduleConflict,
+  getScheduleConflicts,
+  deleteScheduleConflictPost,
   getPosts,
   getPostById,
   updatePostStatus,

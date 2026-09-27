@@ -10,6 +10,7 @@ import {
   Send, 
   Save, 
   AlertCircle,
+  AlertTriangle,
   FileCheck,
   Sparkles
 } from 'lucide-react';
@@ -30,7 +31,79 @@ const PostCreator = () => {
   const [templates, setTemplates] = useState([]);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [scheduleConflicts, setScheduleConflicts] = useState([]);
+  const [checkingSchedule, setCheckingSchedule] = useState(false);
+  const [registeredConflictPostId, setRegisteredConflictPostId] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!scheduledFor) {
+      setScheduleConflicts([]);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const checkSchedule = async () => {
+      setCheckingSchedule(true);
+      try {
+        const response = await api.get('/api/posts/schedule-conflict', {
+          params: { scheduledFor: new Date(scheduledFor).toISOString() }
+        });
+        if (!cancelled) {
+          setScheduleConflicts(response.data.conflicts || []);
+        }
+      } catch {
+        if (!cancelled) {
+          setScheduleConflicts([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setCheckingSchedule(false);
+        }
+      }
+    };
+
+    const timeoutId = setTimeout(checkSchedule, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [scheduledFor]);
+
+  useEffect(() => {
+    if (!scheduledFor || scheduleConflicts.length === 0 || !title.trim() || !content.trim() || platforms.length === 0) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const registerConflict = async () => {
+      try {
+        const response = await api.post('/api/posts/conflicts/register', {
+          conflictPostId: registeredConflictPostId,
+          title,
+          content,
+          platforms,
+          mediaUrl,
+          templateRef: templateRef || null,
+          scheduledFor: new Date(scheduledFor).toISOString(),
+          status: 'Draft'
+        });
+        if (!cancelled) {
+          setRegisteredConflictPostId(response.data._id);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.response?.data?.message || 'Failed to register the conflict post.');
+        }
+      }
+    };
+
+    const timeoutId = setTimeout(registerConflict, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [scheduleConflicts, scheduledFor, title, content, platforms, mediaUrl, templateRef, registeredConflictPostId]);
 
   // Check if we came from "Use Template" redirect
   useEffect(() => {
@@ -101,7 +174,6 @@ const PostCreator = () => {
       setError('A scheduled date and time is required to submit a post for approval.');
       return;
     }
-
     setLoading(true);
     try {
       const payload = {
@@ -114,7 +186,14 @@ const PostCreator = () => {
         status // 'Draft' or 'Pending Approval'
       };
 
-      await api.post('/api/posts', payload);
+      if (registeredConflictPostId) {
+        await api.post('/api/posts/conflicts/register', {
+          ...payload,
+          conflictPostId: registeredConflictPostId
+        });
+      } else {
+        await api.post('/api/posts', payload);
+      }
       setSuccess(status === 'Draft' ? 'Draft saved successfully!' : 'Post submitted for approval!');
       
       // Clear form on success
@@ -137,6 +216,25 @@ const PostCreator = () => {
           Draft a new announcement, attach templates, configure schedules, and submit for review.
         </p>
       </div>
+
+      {scheduleConflicts.length > 0 && (
+        <div className="bg-amber-500/10 border border-amber-500/30 text-amber-300 p-4 rounded-xl flex items-start space-x-3 text-sm animate-fade-in" role="alert">
+          <AlertTriangle size={18} className="shrink-0 mt-0.5" />
+          <div>
+            <p className="font-semibold">Schedule conflict detected</p>
+            <p className="mt-1 text-amber-200/80">
+              Another event ('{scheduleConflicts[0].title}') is already scheduled for this exact same time slot ({new Date(scheduleConflicts[0].scheduledFor).toLocaleString()}). Choose a different publication time.
+            </p>
+            <div className="mt-2 space-y-1 text-xs text-amber-200/70">
+              {scheduleConflicts.map(conflict => (
+                <p key={conflict._id}>
+                  {conflict.title} at {new Date(conflict.scheduledFor).toLocaleString()}
+                </p>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-xl flex items-center space-x-2 text-sm">
@@ -265,6 +363,9 @@ const PostCreator = () => {
                   onChange={(e) => setScheduledFor(e.target.value)}
                   className="w-full px-4 py-3 rounded-xl glass-input text-white text-sm appearance-none"
                 />
+                {checkingSchedule && (
+                  <p className="text-[10px] text-slate-500 mt-2">Checking this time slot...</p>
+                )}
               </div>
             </div>
           </div>

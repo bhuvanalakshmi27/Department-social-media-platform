@@ -12,6 +12,7 @@ import PostCreator from './pages/PostCreator';
 import ApprovalQueue from './pages/ApprovalQueue';
 import Templates from './pages/Templates';
 import Analytics from './pages/Analytics';
+import Notifications from './pages/Notifications';
 
 // Protected Route Wrapper
 const ProtectedRoute = ({ children }) => {
@@ -27,6 +28,13 @@ const AdminRoute = ({ children }) => {
   if (loading) return null;
   if (!user) return <Navigate to="/login" replace />;
   if (!isAdmin) return <Navigate to="/dashboard" replace />;
+  return <Layout>{children}</Layout>;
+};
+
+const ConflictAlertsRoute = ({ children }) => {
+  const { user, loading } = useAuth();
+  if (loading) return null;
+  if (!user) return <Navigate to="/login" replace />;
   return <Layout>{children}</Layout>;
 };
 
@@ -85,6 +93,14 @@ const AppRoutes = () => {
             <Analytics />
           </ProtectedRoute>
         } 
+      />
+      <Route
+        path="/notifications"
+        element={
+          <ConflictAlertsRoute>
+            <Notifications />
+          </ConflictAlertsRoute>
+        }
       />
 
       {/* Admin Only Route */}
