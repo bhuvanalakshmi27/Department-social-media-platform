@@ -5,6 +5,7 @@ require('dotenv').config();
 const User = require('./models/User');
 const Template = require('./models/Template');
 const Post = require('./models/Post');
+const ConflictAlert = require('./models/ConflictAlert');
 const EngagementStat = require('./models/EngagementStat');
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/campuspulse';
@@ -18,6 +19,7 @@ const seedDatabase = async () => {
     await User.deleteMany({});
     await Template.deleteMany({});
     await Post.deleteMany({});
+    await ConflictAlert.deleteMany({});
     await EngagementStat.deleteMany({});
     
     console.log('Collections cleared. Seeding users...');

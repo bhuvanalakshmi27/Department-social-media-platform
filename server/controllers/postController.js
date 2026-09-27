@@ -1,6 +1,7 @@
 const Post = require('../models/Post');
 const User = require('../models/User');
 const EngagementStat = require('../models/EngagementStat');
+const ConflictAlert = require('../models/ConflictAlert');
 const ACTIVE_CONFLICT_STATUSES = ['Draft', 'Pending Approval', 'Approved', 'Scheduled'];
 
 const getScheduleSlot = (scheduledFor) => {
@@ -35,8 +36,60 @@ const findScheduleConflicts = async (scheduledFor, excludePostId, department) =>
   }
 
   return Post.find(query)
-    .select('_id title scheduledFor status platforms')
+    .select('_id title scheduledFor status platforms authorRef')
+    .populate('authorRef', 'name department')
     .sort({ scheduledFor: 1 });
+};
+
+const toConflictSnapshot = (post) => ({
+  originalPostId: post._id,
+  title: post.title,
+  scheduledFor: post.scheduledFor,
+  status: post.status,
+  platforms: post.platforms,
+  authorName: post.authorRef?.name || 'Coordinator'
+});
+
+const persistConflictAlert = async (department, posts) => {
+  if (!department || posts.length < 2) {
+    return;
+  }
+
+  const scheduledFor = getScheduleSlot(posts[0].scheduledFor);
+  const snapshots = posts.map(toConflictSnapshot);
+  let alert = await ConflictAlert.findOne({
+    department,
+    scheduledFor,
+    resolved: false
+  });
+
+  if (!alert) {
+    alert = new ConflictAlert({ department, scheduledFor, posts: snapshots });
+  } else {
+    const snapshotsByPostId = new Map(alert.posts.map(snapshot => [snapshot.originalPostId.toString(), snapshot]));
+    snapshots.forEach(snapshot => snapshotsByPostId.set(snapshot.originalPostId.toString(), snapshot));
+    alert.posts = Array.from(snapshotsByPostId.values());
+  }
+
+  await alert.save();
+};
+
+const removeConflictSnapshot = async (department, scheduledFor, postId) => {
+  const alert = await ConflictAlert.findOne({
+    department,
+    scheduledFor: getScheduleSlot(scheduledFor),
+    resolved: false
+  });
+  if (!alert) {
+    return;
+  }
+
+  alert.posts = alert.posts.filter(snapshot => snapshot.originalPostId.toString() !== postId.toString());
+  if (alert.posts.length < 2) {
+    await ConflictAlert.findByIdAndDelete(alert._id);
+  } else {
+    await alert.save();
+  }
 };
 
 const sendScheduleConflict = (res, conflicts) => {
@@ -327,6 +380,36 @@ const getScheduleConflicts = async (req, res) => {
       conflictGroups.set(scheduleSlot, group);
     });
 
+    for (const postsAtSameTime of conflictGroups.values()) {
+      await persistConflictAlert(req.user.department, postsAtSameTime);
+    }
+
+    if (req.user.role === 'Admin') {
+      const alerts = await ConflictAlert.find({
+        department: req.user.department,
+        resolved: false
+      }).sort({ scheduledFor: 1 });
+
+      alerts.forEach(alert => {
+        const scheduleSlot = getScheduleSlot(alert.scheduledFor).getTime();
+        const existingPosts = conflictGroups.get(scheduleSlot) || [];
+        const existingIds = new Set(existingPosts.map(post => post._id.toString()));
+        alert.posts.forEach(snapshot => {
+          if (!existingIds.has(snapshot.originalPostId.toString())) {
+            existingPosts.push({
+              _id: snapshot.originalPostId,
+              title: snapshot.title,
+              scheduledFor: snapshot.scheduledFor,
+              status: snapshot.status,
+              platforms: snapshot.platforms,
+              authorRef: { name: snapshot.authorName }
+            });
+          }
+        });
+        conflictGroups.set(scheduleSlot, existingPosts);
+      });
+    }
+
     res.json({
       conflicts: Array.from(conflictGroups.values())
         .filter(postsAtSameTime => postsAtSameTime.length > 1)
@@ -346,6 +429,17 @@ const deleteScheduleConflictPost = async (req, res) => {
   try {
     const post = await Post.findById(req.params.id).populate('authorRef', 'department');
     if (!post) {
+      if (req.user.role === 'Admin') {
+        const alert = await ConflictAlert.findOne({
+          department: req.user.department,
+          resolved: false,
+          'posts.originalPostId': req.params.id
+        });
+        if (alert) {
+          await removeConflictSnapshot(req.user.department, alert.scheduledFor, req.params.id);
+          return res.json({ message: 'Conflict alert cleared successfully.', postId: req.params.id });
+        }
+      }
       return res.status(404).json({ message: 'Post not found.' });
     }
 
@@ -358,8 +452,15 @@ const deleteScheduleConflictPost = async (req, res) => {
       return res.status(403).json({ message: 'You can only delete your own conflicting posts.' });
     }
 
+    const conflicts = await findScheduleConflicts(post.scheduledFor, undefined, req.user.department);
+    await persistConflictAlert(req.user.department, conflicts);
+
     await Post.findByIdAndDelete(post._id);
     await EngagementStat.deleteMany({ postRef: post._id });
+
+    if (req.user.role === 'Admin') {
+      await removeConflictSnapshot(req.user.department, post.scheduledFor, post._id);
+    }
 
     res.json({ message: 'Conflicting post deleted successfully.', postId: post._id });
   } catch (error) {
